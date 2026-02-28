@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    @apply bg-white text-zinc-900;
+  }
+}
+
+@keyframes slide-in-from-left {
+  from { transform: translateX(-100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.animate-in.slide-in-from-left {
+  animation: slide-in-from-left 0.2s ease-out;
+}
