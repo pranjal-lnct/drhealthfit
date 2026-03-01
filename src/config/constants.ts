@@ -6,8 +6,8 @@ export const MIN_VISIBILITY_CONFIDENCE = 0.3;
 export const MODEL_PATH = '/models/pose_landmarker_full.task';
 
 // --- 1 Euro Filter (see PRD Section 11.2) ---
-export const ONE_EURO_MIN_CUTOFF = 1.0;
-export const ONE_EURO_BETA = 0.007;
+export const ONE_EURO_MIN_CUTOFF = 0.5;
+export const ONE_EURO_BETA = 0.05;
 export const ONE_EURO_D_CUTOFF = 1.0;
 
 // --- Velocity Profiling (see PRD Section 11.3) ---

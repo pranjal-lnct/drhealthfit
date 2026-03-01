@@ -74,8 +74,8 @@ export interface ExerciseDefinition {
   /** DTW feature extractor: returns angle array for one frame */
   extractDTWFeatures: (angles: ExerciseAngles) => number[];
   dtwDimensions: number;
-  /** Angle extractor from world landmarks */
-  computeAngles: (world: NormalizedLandmark[]) => ExerciseAngles;
+  /** Angle extractor from world landmarks (optional cache for exercises that need it) */
+  computeAngles: (world: NormalizedLandmark[], cache?: unknown) => ExerciseAngles;
   holdDurationMs: number;
   restBetweenSetsMs: number;
   defaultReps: number;

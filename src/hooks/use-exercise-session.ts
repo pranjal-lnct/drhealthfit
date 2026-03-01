@@ -1,7 +1,7 @@
 import { useRef, useEffect, useCallback } from 'react';
 
 import { initPoseDetector, detectPose, closePoseDetector } from '@/core/pose/pose-detector';
-import { createLandmarkFilterBank, filterLandmarks } from '@/core/pose/pose-math';
+import { createOneEuroState, filterOneEuro } from '@/core/pose/pose-math';
 import { computeBoneLengthRatios, isFrameDistorted, computeVelocity, computeTrajectoryScore } from '@/core/pose/biomechanics';
 import {
   createEngine,
@@ -31,14 +31,21 @@ import {
 import { detectOrientation } from '@/core/pose/pose-math';
 import { LANDMARK } from '@/core/pose/landmarks';
 import { dbg } from '@/lib/debug-logger';
+import type { NeckRotationCache } from '@/core/exercises/neck-rotation';
 
 export function useExerciseSession(
   exercise: ExerciseDefinition,
   videoRef: React.RefObject<HTMLVideoElement | null>,
 ) {
   const engineRef = useRef(createEngine(exercise));
-  const filterBankRef = useRef(createLandmarkFilterBank());
   const baselineRef = useRef<BaselineData | null>(null);
+  // Per-angle 1 Euro filters — applied after angle computation, not on raw landmarks
+  const angleFilterRef = useRef<Record<string, ReturnType<typeof createOneEuroState>>>({});
+  // Neck rotation cache (avoids module-level state in neck-rotation.ts)
+  const neckRotationCacheRef = useRef<NeckRotationCache>({
+    angles: { rotationAngle: 0, shoulderTilt: 0, trunkRotationDelta: 0, absRotation: 0 },
+    timestamp: 0,
+  });
   const velocityBufferRef = useRef<VelocityFrame[]>([]);
   const goldenTrajectoryRef = useRef<number[][]>([]);
   const frameCountRef = useRef(0);
@@ -126,7 +133,7 @@ export function useExerciseSession(
 
       // Static baseline capture (2s)
       if (!baselineRef.current && now - baselineCaptureStartRef.current >= BASELINE_CAPTURE_DURATION_MS) {
-        const angles = exercise.computeAngles(world);
+        const angles = exercise.computeAngles(world, exercise.id === 'neck-rotation' ? neckRotationCacheRef.current : undefined);
         const boneLengthRatios = computeBoneLengthRatios(world);
 
         baselineRef.current = {
@@ -150,7 +157,7 @@ export function useExerciseSession(
 
       // Golden rep capture
       if (isCapturingGoldenRef.current && baselineRef.current) {
-        const angles = exercise.computeAngles(world);
+        const angles = exercise.computeAngles(world, exercise.id === 'neck-rotation' ? neckRotationCacheRef.current : undefined);
         const features = exercise.extractDTWFeatures(angles);
 
         if (frameCountRef.current % DTW_TRAJECTORY_SAMPLE_INTERVAL === 0) {
@@ -195,7 +202,7 @@ export function useExerciseSession(
         }
 
         // Detect golden rep completion: returned to starting phase
-        const currentAngles = exercise.computeAngles(world);
+        const currentAngles = exercise.computeAngles(world, exercise.id === 'neck-rotation' ? neckRotationCacheRef.current : undefined);
         const startPhase = exercise.phases[0];
         if (
           goldenTrajectoryRef.current.length > 10 &&
@@ -255,6 +262,7 @@ export function useExerciseSession(
     baselineRef.current = {
       standingAngles: exercise.computeAngles(
         Array.from({ length: 33 }, () => ({ x: 0, y: 0, z: 0, visibility: 1 })),
+        exercise.id === 'neck-rotation' ? neckRotationCacheRef.current : undefined,
       ),
       boneLengthRatios: { thighToShin: 1, upperArmToForearm: 1, torsoToThigh: 1 },
       goldenRepTrajectory: [],
@@ -262,15 +270,20 @@ export function useExerciseSession(
       goldenRepAngles: { rotationAngle: { min: -80, max: 80 } },
     };
 
+    const TARGET_INTERVAL_MS = 1000 / 20; // 20fps — sufficient for slow exercises, halves CPU load
+    let lastFrameMs = 0;
+
     const loop = () => {
       rafIdRef.current = requestAnimationFrame(loop);
+
+      const now = performance.now();
+      if (now - lastFrameMs < TARGET_INTERVAL_MS) return; // throttle
+      lastFrameMs = now;
 
       const video = videoRef.current;
       if (!video || video.readyState < 2) {
         return;
       }
-
-      const now = performance.now();
 
       // FPS calculation
       fpsCountRef.current++;
@@ -301,17 +314,13 @@ export function useExerciseSession(
         (idx) => (normalizedLandmarks[idx]?.visibility ?? 0) >= MIN_VISIBILITY_CONFIDENCE,
       );
 
-      if (!allVisible && engine.state === 'ACTIVE') {
-        // Don't pause — just skip this frame silently
-        usePoseStore.getState().setTracking(false);
-      }
-
+      // Resume engine if it was paused and landmarks are back
       if (engine.isPaused && allVisible) {
         resumeEngine(engine);
       }
 
-      // 1 Euro Filter on world landmarks
-      const filteredWorld = filterLandmarks(filterBankRef.current, rawWorldLandmarks, now);
+      // Use raw world landmarks — angle-level filtering applied below
+      const filteredWorld = rawWorldLandmarks;
 
       // Compute bone ratios once per frame (reused for distortion check and debug metrics)
       const currentRatios = computeBoneLengthRatios(filteredWorld);
@@ -319,7 +328,7 @@ export function useExerciseSession(
       // Bone ratio distortion check — update baseline on first real frame
       if (baselineRef.current && baselineRef.current.boneLengthRatios.thighToShin === 1) {
         baselineRef.current.boneLengthRatios = currentRatios;
-        baselineRef.current.standingAngles = exercise.computeAngles(filteredWorld);
+        baselineRef.current.standingAngles = exercise.computeAngles(filteredWorld, exercise.id === 'neck-rotation' ? neckRotationCacheRef.current : undefined);
         dbg.info('Loop', 'Baseline captured from first real frame', baselineRef.current.boneLengthRatios);
       }
       let isDistorted = false;
@@ -338,8 +347,8 @@ export function useExerciseSession(
         return;
       }
 
-      // --- ACTIVE: Skip distorted frames ---
-      if (engine.state === 'ACTIVE' && isDistorted) {
+      // --- ACTIVE: Skip distorted frames (not for neck-rotation — head movement affects ratios)
+      if (engine.state === 'ACTIVE' && isDistorted && exercise.id !== 'neck-rotation') {
         return;
       }
 
@@ -348,7 +357,17 @@ export function useExerciseSession(
       }
 
       // Compute angles from world landmarks
-      const angles = exercise.computeAngles(filteredWorld);
+      const rawAngles = exercise.computeAngles(filteredWorld, exercise.id === 'neck-rotation' ? neckRotationCacheRef.current : undefined);
+
+      // Apply 1 Euro filter per angle scalar — much more stable than filtering 33×3 landmark positions
+      const angleFilters = angleFilterRef.current;
+      const angles: typeof rawAngles = {} as typeof rawAngles;
+      for (const key of Object.keys(rawAngles) as (keyof typeof rawAngles)[]) {
+        const val = rawAngles[key];
+        if (typeof val !== 'number') { (angles as Record<string, unknown>)[key] = val; continue; }
+        if (!angleFilters[key]) angleFilters[key] = createOneEuroState();
+        (angles as Record<string, number>)[key] = filterOneEuro(angleFilters[key]!, val, now);
+      }
 
       // Velocity
       const primaryAngle = exercise.extractDTWFeatures(angles)[0] ?? 0;

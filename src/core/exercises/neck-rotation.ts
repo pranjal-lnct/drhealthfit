@@ -11,42 +11,61 @@ const SHOULDER_TILT_THRESHOLD = 0.20;
 const MAX_ROTATION_VELOCITY = 120;
 const HYPERMOBILITY_ABSOLUTE = 95;
 const HYPERMOBILITY_MARGIN = 10;
+const LAST_VALID_EXPIRY_MS = 200;
 
-// Cached zero result to avoid object allocation on every invalid frame
-const ZERO_ANGLES: ExerciseAngles = { rotationAngle: 0, shoulderTilt: 0, trunkRotationDelta: 0, absRotation: 0 };
+// Cache type for storing last valid angles (passed from session hook to avoid module-level state)
+export interface NeckRotationCache {
+  angles: ExerciseAngles;
+  timestamp: number;
+}
 
-function computeNeckAngles(world: NormalizedLandmark[]): ExerciseAngles {
+function computeNeckAngles(world: NormalizedLandmark[], cache?: unknown): ExerciseAngles {
+  const c = cache as NeckRotationCache | undefined;
+  const now = performance.now();
   const nose = world[LANDMARK.NOSE];
+  const leftEar = world[LANDMARK.LEFT_EAR];
+  const rightEar = world[LANDMARK.RIGHT_EAR];
+  const leftEyeInner = world[LANDMARK.LEFT_EYE_INNER];
+  const rightEyeInner = world[LANDMARK.RIGHT_EYE_INNER];
   const leftShoulder = world[LANDMARK.LEFT_SHOULDER];
   const rightShoulder = world[LANDMARK.RIGHT_SHOULDER];
 
-  if (!nose || !leftShoulder || !rightShoulder) return ZERO_ANGLES;
-  if ((nose.visibility ?? 0) < 0.3) return ZERO_ANGLES;
+  const defaultAngles: ExerciseAngles = { rotationAngle: 0, shoulderTilt: 0, trunkRotationDelta: 0, absRotation: 0 };
 
-  // Use shoulder midpoint as the neutral head center reference.
-  // This is stable regardless of head rotation (shoulders don't move during neck rotation).
+  if (!leftShoulder || !rightShoulder) {
+    return c && (now - c.timestamp < LAST_VALID_EXPIRY_MS) ? c.angles : defaultAngles;
+  }
+
   const shoulderMidX = (leftShoulder.x + rightShoulder.x) / 2;
   const shoulderWidth = Math.abs(leftShoulder.x - rightShoulder.x);
+  if (shoulderWidth < 0.01) return c ? c.angles : defaultAngles;
 
-  if (shoulderWidth < 0.01) return ZERO_ANGLES; // degenerate frame
+  const headPoints = [nose, leftEar, rightEar, leftEyeInner, rightEyeInner];
+  let weightedX = 0;
+  let totalWeight = 0;
+  for (const pt of headPoints) {
+    if (!pt) continue;
+    const vis = pt.visibility ?? 0;
+    if (vis < 0.15) continue;
+    weightedX += pt.x * vis;
+    totalWeight += vis;
+  }
 
-  // Nose offset from shoulder center, normalized by half shoulder width
-  // Multiply by -1 to match user perspective (turn left = negative angle)
-  const noseOffset = nose.x - shoulderMidX;
-  const rotationAngle = -(noseOffset / (shoulderWidth * 0.5)) * 90;
+  if (totalWeight < 0.15) {
+    return c && (now - c.timestamp < LAST_VALID_EXPIRY_MS) ? c.angles : defaultAngles;
+  }
 
-  const shoulderTilt = shoulderWidth > 0
-    ? Math.abs(leftShoulder.y - rightShoulder.y) / shoulderWidth
-    : 0;
-
+  const headX = weightedX / totalWeight;
+  const normalizedOffset = Math.max(-1, Math.min(1, (headX - shoulderMidX) / (shoulderWidth * 0.5)));
+  const rotationAngle = -(Math.asin(normalizedOffset) * (180 / Math.PI));
+  const shoulderTilt = Math.abs(leftShoulder.y - rightShoulder.y) / shoulderWidth;
   const trunkRotationDelta = Math.abs(leftShoulder.z - rightShoulder.z);
 
-  return {
-    rotationAngle,
-    shoulderTilt,
-    trunkRotationDelta,
-    absRotation: Math.abs(rotationAngle),
-  };
+  const newAngles = { rotationAngle, shoulderTilt, trunkRotationDelta, absRotation: Math.abs(rotationAngle) };
+
+  if (c) { c.angles = newAngles; c.timestamp = now; }
+
+  return newAngles;
 }
 
 export const neckRotationExercise: ExerciseDefinition = {
